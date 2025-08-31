@@ -1,0 +1,39 @@
+[gd_scene load_steps=7 format=3 uid="uid://dn1p117y02xsv"]
+
+[ext_resource type="Script" uid="uid://cwxukj2yrchpc" path="res://scripts/dungeon/DungeonGenerator.gd" id="1_yt54b"]
+[ext_resource type="Script" uid="uid://t0vmer8j5la1" path="res://scripts/dungeon/PrefabSpec.gd" id="2_gotga"]
+[ext_resource type="Resource" uid="uid://becv4xusvjsbr" path="res://rooms/Stairs_Up_Room.tres" id="3_xcrur"]
+[ext_resource type="Resource" uid="uid://b3bslsokg2vm5" path="res://rooms/Stairs_Down_Room.tres" id="4_l1cm7"]
+[ext_resource type="MeshLibrary" uid="uid://uh65s0cewgi1" path="res://rooms/pieces/dungeon.meshlib" id="5_l37hg"]
+[ext_resource type="Script" uid="uid://dk0knf76m2jwb" path="res://scripts/tools/DungeonStressRunner.gd" id="6_hdumx"]
+
+[node name="Test" type="Node3D"]
+
+[node name="Dungeon" type="Node3D" parent="."]
+script = ExtResource("1_yt54b")
+width = 30
+height = 30
+room_max = 5
+room_attempts = 5
+prefabs = Array[ExtResource("2_gotga")]([ExtResource("3_xcrur"), ExtResource("4_l1cm7")])
+player_path = NodePath("../Player")
+build_perimeter_fence = false
+build_perimeter_visuals = false
+prefab_path_mode = 1
+prefab_detour_radius = 10
+prefab_detour_count = 2
+prefab_detour_fallback = false
+
+[node name="GridFloors" type="GridMap" parent="Dungeon"]
+mesh_library = ExtResource("5_l37hg")
+
+[node name="GridWalls" type="GridMap" parent="Dungeon"]
+mesh_library = ExtResource("5_l37hg")
+
+[node name="Props" type="Node3D" parent="Dungeon"]
+
+[node name="Navigation" type="Node3D" parent="Dungeon"]
+
+[node name="DungeonStressRunner" type="Node3D" parent="."]
+script = ExtResource("6_hdumx")
+generator_path = NodePath("../Dungeon")
