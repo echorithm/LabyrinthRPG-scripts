@@ -1,3 +1,5 @@
+# mirror: test — 2025-08-31
+#res://scripts/dungeon/DungeonGenerator.gd
 extends Node3D
 
 signal finish_triggered
