@@ -1,0 +1,368 @@
+extends Node
+class_name LevelManager
+
+# Toggle on/off from the Inspector
+@export var debug_saves: bool = true
+
+# Autoload instance (typed)
+@onready var SaveManagerInst: SaveManager = get_node("/root/SaveManager") as SaveManager
+
+# --- Wire up to your DungeonGenerator node (usually the parent "Dungeon") ---
+@export var dungeon_path: NodePath
+
+# --- Growth rules ---
+@export var size_growth_pct: float = 10.0      # each “up” grows W/H by +10% (ceil)
+@export var rooms_inc_every: int = 10          # every +10 in max dimension => +1 to room_attempts & room_max
+@export var size_cap: int = 256                # hard cap per side (safety)
+@export var keep_sizes_odd: bool = true        # keep sizes odd (grid-friendly)
+
+# --- Optional: auto-open any door tagged with this group after a NEW (forward) level ---
+@export var entry_door_group: StringName = &"spawn_entry_door"
+
+# --- Internals ---
+var _gen: Node = null
+var _entry_should_open: bool = false
+var _during_transition: bool = false
+
+var _current_floor: int = 0
+var _floors: Array[Dictionary] = []            # stack of floor states
+
+# Baselines captured from floor 0 at startup
+var _base_width: int = 0
+var _base_height: int = 0
+var _base_room_attempts: int = 0
+var _base_room_max: int = 0
+
+
+func _ready() -> void:
+	# Resolve generator
+	if dungeon_path != NodePath() and has_node(dungeon_path):
+		_gen = get_node(dungeon_path)
+	else:
+		_gen = get_parent()
+
+	if _gen == null:
+		push_error("[LevelManager] Could not resolve DungeonGenerator node.")
+		return
+
+	# Capture baselines from current generator settings
+	_base_width         = int(_safe_get(_gen, "width", 11))
+	_base_height        = int(_safe_get(_gen, "height", 11))
+	_base_room_attempts = int(_safe_get(_gen, "room_attempts", 1))
+	_base_room_max      = int(_safe_get(_gen, "room_max", 1))
+
+	# Initialize floor 0 state from the current generator
+	if _floors.is_empty():
+		var s0: Dictionary = {
+			"seed": int(_safe_get(_gen, "rng_seed", randi())),
+			"width": _base_width,
+			"height": _base_height,
+			"room_attempts": _base_room_attempts,
+			"room_max": _base_room_max
+		}
+		_floors.append(s0)
+
+	scan_and_log_doors()
+	call_deferred("_post_ready_sync")
+
+# -------------------------------------------------------------------
+# Public API (called by doors or other game logic)
+# -------------------------------------------------------------------
+func goto_next_level() -> void:
+	_current_floor += 1
+	_ensure_floor_state(_current_floor)
+	_apply_state(_floors[_current_floor], false)
+	SaveManagerInst.set_run_floor(_current_floor)
+	_debug_print_saves("next")
+	SaveManagerInst.ensure_sigil_segment_for_floor(_current_floor, 4) # or 3/5 if you like
+
+func goto_prev_level() -> void:
+	if _current_floor <= 0:
+		_current_floor = 0
+		return
+	_current_floor -= 1
+	_apply_state(_floors[_current_floor], true)
+	SaveManagerInst.set_run_floor(_current_floor)
+	_debug_print_saves("prev")
+	SaveManagerInst.ensure_sigil_segment_for_floor(_current_floor, 4) # or 3/5 if you like
+
+# Optional alias if something calls this name
+func request_next_level() -> void:
+	goto_next_level()
+
+# -------------------------------------------------------------------
+# Internals
+# -------------------------------------------------------------------
+func _ensure_floor_state(index: int) -> void:
+	# Already exists?
+	if index < _floors.size() and typeof(_floors[index]) == TYPE_DICTIONARY:
+		return
+
+	# Base from previous floor (or baseline if none)
+	var prev: Dictionary
+	if index - 1 >= 0 and index - 1 < _floors.size() and typeof(_floors[index - 1]) == TYPE_DICTIONARY:
+		prev = _floors[index - 1]
+	else:
+		prev = {
+			"seed": int(_safe_get(_gen, "rng_seed", randi())),
+			"width": _base_width,
+			"height": _base_height,
+			"room_attempts": _base_room_attempts,
+			"room_max": _base_room_max
+		}
+
+	# Grow size
+	var prev_w: int = int(prev["width"])
+	var prev_h: int = int(prev["height"])
+	var new_w: int = int(ceil(float(prev_w) * (1.0 + size_growth_pct * 0.01)))
+	var new_h: int = int(ceil(float(prev_h) * (1.0 + size_growth_pct * 0.01)))
+
+	if keep_sizes_odd:
+		if (new_w & 1) == 0: new_w += 1
+		if (new_h & 1) == 0: new_h += 1
+
+	new_w = min(size_cap, new_w)
+	new_h = min(size_cap, new_h)
+
+	# Bump rooms every +rooms_inc_every in max dimension above baseline
+	var max_dim: int = max(new_w, new_h)
+	var base_dim: int = max(_base_width, _base_height)
+	var increments: int = 0
+	if max_dim > base_dim and rooms_inc_every > 0:
+		increments = int(floor(float(max_dim - base_dim) / float(rooms_inc_every)))
+
+	var ra: int = _base_room_attempts + increments
+	var rm: int = _base_room_max + increments
+
+	# --- IMPORTANT: persistent, per-floor seed ---
+	var seed_val: int
+	if index >= 1:
+		seed_val = SaveManager.get_or_create_seed(index)  # deterministic per floor
+	else:
+		# floor 0 is just your baseline snapshot
+		var rng := RandomNumberGenerator.new()
+		rng.randomize()
+		seed_val = int(rng.randi())
+
+	var state: Dictionary = {
+		"seed": seed_val,
+		"width": new_w,
+		"height": new_h,
+		"room_attempts": ra,
+		"room_max": rm
+	}
+
+	if index >= _floors.size():
+		_floors.resize(index + 1)
+	_floors[index] = state
+
+
+func _apply_state(state: Dictionary, backtracking: bool) -> void:
+	if _gen == null: return
+	_during_transition = true
+
+	_safe_set(_gen, "width", int(state.get("width", _base_width)))
+	_safe_set(_gen, "height", int(state.get("height", _base_height)))
+	_safe_set(_gen, "room_attempts", int(state.get("room_attempts", _base_room_attempts)))
+	_safe_set(_gen, "room_max", int(state.get("room_max", _base_room_max)))
+
+	var seed: int = int(state.get("seed", randi()))
+	_safe_set(_gen, "rng_seed", seed)
+
+	if _gen.has_method("_apply_seed"):
+		_gen.call("_apply_seed", false)
+	if _gen.has_method("_generate_and_paint"):
+		_gen.call("_generate_and_paint")
+
+	# 1) Build anchors (elite/treasure) for this floor
+	if _gen.has_method("build_anchors_for_floor"):
+		_gen.call("build_anchors_for_floor", _current_floor)
+
+	# 2) Start encounter loop for this floor + reset step counting
+	var enc := get_node_or_null(^"/root/EncounterDirector")
+	if enc != null and _gen.has_method("get_floor_navdata"):
+		var navdata: Dictionary = _gen.call("get_floor_navdata")
+		var rs: Dictionary = SaveManagerInst.load_run()
+		var run_seed: int = int(dget(rs, "run_seed", 0))
+
+		# Reset EncounterDirector with fresh floor state
+		enc.call("start_floor", _current_floor, run_seed, navdata)
+
+		# Re-register the player and reset its stepper (so floor 2+ rolls resume)
+		var player_path: NodePath = (_gen.get("player_path") as NodePath) if _gen.has_method("get") else NodePath()
+		if player_path != NodePath() and _gen.has_node(player_path):
+			var player: Node = _gen.get_node(player_path)
+			if player != null:
+				if enc.has_method("register_player"):
+					enc.call("register_player", player)
+
+				var stepper: Node = player.get_node_or_null(^"StepStepper")
+				if stepper != null:
+					if stepper.has_method("reset_after_floor_change"):
+						stepper.call("reset_after_floor_change")
+					# Optional: wire a signal if your stepper exposes one
+					if stepper.has_signal("stepped") and not stepper.is_connected("stepped", Callable(enc, "on_step")):
+						stepper.connect("stepped", Callable(enc, "on_step"))
+				elif player.has_method("reset_after_floor_change"):
+					player.call("reset_after_floor_change")
+
+	# 3) Populate elites & boss from anchors
+	if _gen.has_method("populate_elites_and_boss"):
+		_gen.call("populate_elites_and_boss", _current_floor)
+
+	# 4) Entry door handling as before
+	if _entry_should_open or not backtracking:
+		_open_spawn_entry_doors()
+	_entry_should_open = false
+	_during_transition = false
+
+	print("[LM] floor=", _current_floor,
+		" size=", int(state.get("width",0)), "x", int(state.get("height",0)),
+		" seed=", int(state.get("seed", -1)))
+
+
+
+
+# --- tiny util helpers to avoid Variant inference warnings ---
+func _safe_get(o: Object, prop: String, fallback: Variant) -> Variant:
+	if o == null: return fallback
+	if o.has_method("get"):
+		var v: Variant = o.get(prop)
+		return v if v != null else fallback
+	return fallback
+
+func _safe_set(o: Object, prop: String, v: Variant) -> void:
+	if o == null: return
+	if o.has_method("set"):
+		o.set(prop, v)
+
+func scan_and_log_doors() -> void:
+	var doors: Array = get_tree().get_nodes_in_group(&"exit_door")
+	print("[LM] exit_door group members: ", doors.size())
+	for d in doors:
+		if d != null:
+			if d.has_method("debug_dump"):
+				d.call("debug_dump")
+			else:
+				print("[LM] door without debug_dump: ", d.get_path())
+
+func set_entry_should_open(v: bool) -> void:
+	_entry_should_open = v
+
+func is_transitioning() -> bool:
+	return _during_transition
+
+func sync_to_saved_floor() -> void:
+	var target: int
+	if SaveManager.run_exists():
+		target = SaveManager.peek_run_depth()
+	else:
+		target = SaveManager.get_current_floor()
+
+	# Clamp to at least Floor 1
+	if target < 1:
+		target = 1
+
+	# Build states up to the target floor and apply it
+	while _current_floor < target:
+		_current_floor += 1
+		_ensure_floor_state(_current_floor)
+
+	_apply_state(_floors[_current_floor], false)
+	# Mirror to saves (harmless if already correct)
+	SaveManager.set_run_floor(_current_floor)
+	
+func _post_ready_sync() -> void:
+	if _gen != null and not _gen.is_node_ready():
+		await _gen.ready
+	await get_tree().process_frame
+	sync_to_saved_floor()
+	_debug_print_saves("resume")
+	
+func _seg_for_floor(floor: int) -> int:
+	return (max(1, floor) - 1) / 3 + 1
+
+static func dget(d: Dictionary, key: String, def: Variant) -> Variant:
+	return d[key] if d.has(key) else def
+
+func _debug_print_saves(context: String) -> void:
+	if not debug_saves:
+		return
+
+	# --- META (Dictionary) ---
+	var gs: Dictionary = SaveManagerInst.load_game()
+	var prev: int = int(dget(gs, "previous_floor", 0))
+	var cur: int = int(dget(gs, "current_floor", 1))
+	var last: int = int(dget(gs, "last_floor", 1))
+	var schema_meta: int = int(dget(gs, "schema_version", 1))
+
+	print("[DBG][", context, "] META schema=", schema_meta,
+		" prev=", prev, " cur=", cur, " last=", last,
+		" seg(cur)=", _seg_for_floor(cur))
+
+	# Anchors
+	var anchors_any: Variant = dget(gs, "anchors_unlocked", [])
+	var anchors_arr: Array = (anchors_any as Array) if anchors_any is Array else []
+	var anchors_strs: Array[String] = []
+	for a in anchors_arr:
+		anchors_strs.append(str(int(a)))
+	
+
+	# Segments
+	var seg_any: Variant = dget(gs, "world_segments", [])
+	var seg_arr: Array = (seg_any as Array) if seg_any is Array else []
+	var seg_lines: Array[String] = []
+	for s_any in seg_arr:
+		if not (s_any is Dictionary):
+			continue
+		var sd: Dictionary = s_any as Dictionary
+		var sid: int = int(dget(sd, "segment_id", 1))
+		var drained: bool = bool(dget(sd, "drained", false))
+		var boss: bool = bool(dget(sd, "boss_sigil", false))
+		seg_lines.append("id=%d drained=%s boss=%s" % [sid, str(drained), str(boss)])
+	
+
+	# Penalties
+	var p_any: Variant = dget(gs, "penalties", {})
+	var p: Dictionary = (p_any as Dictionary) if p_any is Dictionary else {}
+	var lvl_pct: float = float(dget(p, "level_pct", 0.10))
+	var skill_pct: float = float(dget(p, "skill_xp_pct", 0.15))
+	var floor_lvl: int = int(dget(p, "floor_at_level", 1))
+	var floor_skill: int = int(dget(p, "floor_at_skill_level", 1))
+	print("[DBG][", context, "] PEN level%=", lvl_pct,
+		" skill%=", skill_pct,
+		" floor_at_level=", floor_lvl,
+		" floor_at_skill_level=", floor_skill)
+
+	# Seeds (sorted)
+	var seeds_any: Variant = dget(gs, "floor_seeds", {})
+	var seeds: Dictionary = (seeds_any as Dictionary) if seeds_any is Dictionary else {}
+	var keys_int: Array[int] = []
+	for k in seeds.keys():
+		keys_int.append(int(k))
+	keys_int.sort()
+	var parts: Array[String] = []
+	for k in keys_int:
+		parts.append("%d:%d" % [k, int(seeds[k])])
+	
+
+	# --- RUN (Dictionary) ---
+	var rs: Dictionary = SaveManagerInst.load_run()
+	var run_depth: int = int(dget(rs, "depth", 1))
+	var run_seed: int = int(dget(rs, "run_seed", 0))
+	var hp_max: int = int(dget(rs, "hp_max", 30))
+	var hp: int = int(dget(rs, "hp", hp_max))
+	var mp_max: int = int(dget(rs, "mp_max", 10))
+	var mp: int = int(dget(rs, "mp", mp_max))
+	var gold: int = int(dget(rs, "gold", 0))
+	print("[DBG][", context, "] RUN exists=", SaveManagerInst.run_exists(),
+		" depth=", run_depth, " run_seed=", run_seed,
+		" hp=", hp, "/", hp_max, " mp=", mp, "/", mp_max, " gold=", gold)
+
+	print("[DBG][", context, "] LM _current_floor=", _current_floor)
+
+func _open_spawn_entry_doors() -> void:
+	var list: Array = get_tree().get_nodes_in_group(entry_door_group)
+	for n in list:
+		if n != null and n.has_method("force_open_unlocked_now"):
+			n.call("force_open_unlocked_now")
